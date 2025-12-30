@@ -1,19 +1,33 @@
-from rocketmq.client import PushConsumer, ConsumeStatus
-import time, sys
+import pika
 
-def on_message(msg):
-    print('[消费到] msgId=%s  body=%s' % (msg.id, msg.body.decode('utf-8')))
-    return ConsumeStatus.CONSUME_SUCCESS   # 告诉 Broker 消费成功
+# 1. 建立连接
+connection = pika.BlockingConnection(
+    pika.ConnectionParameters(
+        host='localhost',
+        credentials=pika.PlainCredentials('admin', 'password')
+    )
+)
 
-consumer = PushConsumer('python-demo-group')  # 消费组名随意
-consumer.set_namesrv_addr('localhost:9876')   # NameServer 地址
-consumer.subscribe('TopicTest', on_message)   # 订阅主题（* 表示全部 Tag）
-consumer.start()
+channel = connection.channel()
 
-print('[INFO] 消费者已启动，等待消息…  Ctrl+C 退出')
-try:
-    while True:
-        time.sleep(1)
-except KeyboardInterrupt:
-    print('正在关闭…')
-    consumer.shutdown()
+# 2. 声明队列
+channel.queue_declare(queue='task_post', durable=True)
+
+def callback(ch, method, properties, body):
+    print("收到消息:", body.decode())
+
+    # 手动确认
+    ch.basic_ack(delivery_tag=method.delivery_tag)
+
+# 3. 一次只处理一条
+channel.basic_qos(prefetch_count=1)
+
+# 4. 开始消费
+channel.basic_consume(
+    queue='task_post',
+    on_message_callback=callback,
+    auto_ack=False
+)
+
+print("等待消息中...")
+channel.start_consuming()
