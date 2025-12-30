@@ -1,6 +1,13 @@
 import pika
 import json
 import requests
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+JAVA_HOST = os.getenv('JAVA_HOST')
+RABBIT_HOST = os.getenv('RABBIT_HOST')
 
 def get_json(body: bytes) -> dict:
     """
@@ -18,7 +25,7 @@ def callback(ch, method, properties, body):
         "paperId": raw_data.get("paperId"),
         "fileType": "BIN"
     }
-    resp = requests.get("http://localhost:8080/paper/fetchJsonFile", params=params, stream=True)
+    resp = requests.get(f"{JAVA_HOST}paper/fetchJsonFile", params=params, stream=True)
 
     content_bytes = resp.content
 
@@ -36,7 +43,7 @@ def consume():
     # 1. 建立连接
     connection = pika.BlockingConnection(
         pika.ConnectionParameters(
-            host='localhost',
+            host='RABBIT_HOST',
             credentials=pika.PlainCredentials('admin', 'password')
         )
     )
