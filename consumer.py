@@ -43,7 +43,7 @@ def consume():
     # 1. 建立连接
     connection = pika.BlockingConnection(
         pika.ConnectionParameters(
-            host='RABBIT_HOST',
+            host=RABBIT_HOST,
             credentials=pika.PlainCredentials('admin', 'password')
         )
     )
