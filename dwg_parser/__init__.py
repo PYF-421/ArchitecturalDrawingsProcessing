@@ -2,6 +2,36 @@
 DWG JSON Parser - CAD建筑图纸解析工具包
 
 支持从文件路径、字典或字节数据加载JSON
+
+模块结构：
+- loader: JSON数据加载器
+- entity_manager: 实体管理器
+- layer_manager: 图层管理器
+- insert_manager: 块引用管理器
+- entity_extractors: 各类实体属性提取器
+- utils: 工具函数
+
+使用示例：
+    from dwg_parser import DwgParser
+    
+    # 从文件加载
+    parser = DwgParser("drawing.json")
+    
+    # 获取所有图层
+    layers = parser.get_all_layer_names()
+    
+    # 获取所有实体
+    entities = parser.get_all_entities()
+    
+    # 获取TEXT实体的属性
+    text_entities = parser.get_entities_by_type("TEXT")
+    for entity in text_entities:
+        attrs = parser.extract_entity_attrs(entity)
+        print(attrs["text_content"])
+    
+    # 使用INSERT管理器
+    insert_mgr = parser.insert_manager
+    blocks = insert_mgr.get_all_block_definitions()
 """
 
 from typing import Any, Optional, Union
@@ -462,8 +492,40 @@ class LwPolylineExtractor(BaseEntityExtractor):
                 "bounding_box": calculate_bounding_box_points([{"x": v["x"], "y": v["y"]} for v in vertices])}
 
 
-EXTRACTOR_REGISTRY = {"TEXT": TextExtractor, "MTEXT": MTextExtractor, "LINE": LineExtractor,
-                      "CIRCLE": CircleExtractor, "ARC": ArcExtractor, "LWPOLYLINE": LwPolylineExtractor}
+class InsertExtractor(BaseEntityExtractor):
+    ENTITY_TYPE = "INSERT"
+    def extract(self, entity_info: Any) -> dict:
+        common = self._extract_common_attrs(entity_info)
+        raw = entity_info.raw_data
+        insertion_point = point_to_dict(raw.get("insertionPoint"))
+        x_scale = raw.get("xScale", 1.0)
+        y_scale = raw.get("yScale", 1.0)
+        z_scale = raw.get("zScale", 1.0)
+        column_count = raw.get("columnCount", 0)
+        row_count = raw.get("rowCount", 0)
+        raw_attribs = raw.get("attribs", [])
+        attributes = {}
+        for attr in raw_attribs:
+            tag = attr.get("tag", "")
+            value = attr.get("text", "") or attr.get("value", "")
+            if tag:
+                attributes[tag] = value
+        return {**common, "block_name": raw.get("name", ""), "insertion_point": insertion_point,
+                "x_scale": x_scale, "y_scale": y_scale, "z_scale": z_scale,
+                "rotation": raw.get("rotation", 0.0), "column_count": column_count,
+                "row_count": row_count, "column_spacing": raw.get("columnSpacing", 0.0),
+                "row_spacing": raw.get("rowSpacing", 0.0), "attributes": attributes,
+                "raw_attributes": raw_attribs, "is_array": column_count > 1 or row_count > 1,
+                "is_mirrored": x_scale < 0 or y_scale < 0,
+                "has_uniform_scale": abs(x_scale - y_scale) < 1e-6 and abs(y_scale - z_scale) < 1e-6,
+                "extrusion_direction": point_to_dict(raw.get("extrusionDirection"))}
+
+
+EXTRACTOR_REGISTRY = {
+    "TEXT": TextExtractor, "MTEXT": MTextExtractor, "LINE": LineExtractor,
+    "CIRCLE": CircleExtractor, "ARC": ArcExtractor, "LWPOLYLINE": LwPolylineExtractor,
+    "INSERT": InsertExtractor,
+}
 _extractor_instances = {}
 
 def get_extractor(entity_type: str):
@@ -477,6 +539,13 @@ def register_extractor(entity_type: str, extractor_cls):
     entity_type = entity_type.upper()
     EXTRACTOR_REGISTRY[entity_type] = extractor_cls
     _extractor_instances.pop(entity_type, None)
+
+
+# ============================================================
+# InsertManager 导入
+# ============================================================
+
+from dwg_parser.insert_manager import InsertManager, InsertInfo, BlockDefinition, TransformedPoint
 
 
 # ============================================================
@@ -504,6 +573,7 @@ class DwgParser:
             self.loader.load()
         self.entity_manager = EntityManager(self.loader)
         self.layer_manager = LayerManager(self.loader)
+        self.insert_manager = InsertManager(self.loader)
     
     @classmethod
     def from_file(cls, json_path: str) -> 'DwgParser':
@@ -546,7 +616,26 @@ class DwgParser:
     
     def get_supported_entity_types(self) -> list:
         return list(EXTRACTOR_REGISTRY.keys())
+    
+    # ============================================================
+    # INSERT相关便捷方法
+    # ============================================================
+    
+    def get_all_block_definitions(self):
+        """获取所有块定义"""
+        return self.insert_manager.get_all_block_definitions()
+    
+    def get_block_definition(self, name: str):
+        """获取指定块定义"""
+        return self.insert_manager.get_block_definition(name)
+    
+    def get_all_inserts(self, include_nested: bool = True):
+        """获取所有INSERT实体"""
+        return self.insert_manager.get_all_inserts(include_nested)
 
 
-__all__ = ['DwgParser', 'DwgJsonLoader', 'EntityManager', 'EntityInfo', 'LayerManager',
-           'get_extractor', 'register_extractor', 'EXTRACTOR_REGISTRY', 'BaseEntityExtractor']
+__all__ = [
+    'DwgParser', 'DwgJsonLoader', 'EntityManager', 'EntityInfo', 'LayerManager',
+    'InsertManager', 'InsertInfo', 'BlockDefinition', 'TransformedPoint',
+    'get_extractor', 'register_extractor', 'EXTRACTOR_REGISTRY', 'BaseEntityExtractor',
+]

@@ -24,6 +24,7 @@ from dwg_parser.entity_extractors.line import LineExtractor
 from dwg_parser.entity_extractors.circle import CircleExtractor
 from dwg_parser.entity_extractors.arc import ArcExtractor
 from dwg_parser.entity_extractors.lwpolyline import LwPolylineExtractor
+from dwg_parser.entity_extractors.insert import InsertExtractor
 
 
 # 提取器注册表：实体类型名 -> 提取器类
@@ -34,6 +35,7 @@ EXTRACTOR_REGISTRY: dict[str, Type[BaseEntityExtractor]] = {
     "CIRCLE": CircleExtractor,
     "ARC": ArcExtractor,
     "LWPOLYLINE": LwPolylineExtractor,
+    "INSERT": InsertExtractor,
 }
 
 # 提取器实例缓存（单例模式）
@@ -47,7 +49,7 @@ def get_extractor(entity_type: str) -> Optional[BaseEntityExtractor]:
     使用单例模式，同一类型的提取器只创建一个实例
     
     Args:
-        entity_type: 实体类型名（如 "TEXT", "LINE" 等）
+        entity_type: 实体类型名（如 "TEXT", "LINE", "INSERT" 等）
         
     Returns:
         提取器实例，如果该类型没有注册则返回None
@@ -157,6 +159,7 @@ __all__ = [
     'CircleExtractor',
     'ArcExtractor',
     'LwPolylineExtractor',
+    'InsertExtractor',
     'EXTRACTOR_REGISTRY',
     'get_extractor',
     'register_extractor',
