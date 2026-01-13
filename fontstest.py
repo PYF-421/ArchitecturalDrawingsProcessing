@@ -18,8 +18,8 @@ from collections import defaultdict
 # ============================================================================
 # 参数配置
 # ============================================================================
-INPUT_DXF_PATH = r"G:\Desktop\test\设计说明.dxf"
-OUTPUT_DIR = r"G:\Desktop\test\output_new4"
+INPUT_DXF_PATH = r"interest.dxf"
+OUTPUT_DIR = r"fontstest"
 # 背景颜色
 BACKGROUND_COLOR = (33, 40, 48)
 
@@ -118,8 +118,8 @@ class DXFConverter:
             return (255, 255, 255)
     
     def _load_fonts(self):
-        for path in ["G:\workproject\DXF_processing\方正仿宋_GBK.TTF",
-                     "G:\workproject\DXF_processing\方正仿宋_GBK.TTF",]:
+        for path in ["华文仿宋.TTF",
+                     "华文仿宋.TTF",]:
             try:
                 ImageFont.truetype(path, 20)
                 self.chinese_font = path
@@ -130,8 +130,8 @@ class DXFConverter:
         else:
             self.chinese_font = None
         
-        for path in ["G:\workproject\DXF_processing\等线 Light.ttf",
-                     "G:\workproject\DXF_processing\等线 Light.ttf"]:
+        for path in ["等线.ttf",
+                     "等线.ttf"]:
 
             try:
                 ImageFont.truetype(path, 20)
@@ -1207,7 +1207,7 @@ class DXFConverter:
                 cropped = image.crop(crop_box)
                 
                 # 保存
-                split_path = os.path.join(frame_dir, f"frame_{frame_index}_{split_index}.png")
+                split_path = os.path.join(frame_dir, f"frame_{frame_index}_{col_idx + 1}_{row_idx + 1}.png")
                 cropped.save(split_path, 'PNG', dpi=(OUTPUT_DPI, OUTPUT_DPI))
                 
                 saved_count += 1
