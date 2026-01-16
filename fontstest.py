@@ -18,8 +18,12 @@ from collections import defaultdict
 # ============================================================================
 # 参数配置
 # ============================================================================
-INPUT_DXF_PATH = r"interest.dxf"
-OUTPUT_DIR = r"fontstest"
+# 获取脚本所在目录
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+INPUT_DXF_PATH = os.path.join(SCRIPT_DIR, "interest.dxf")
+OUTPUT_DIR = os.path.join(SCRIPT_DIR, "fontstest-2")
+# INPUT_DXF_PATH = r"interest.dxf"
+# OUTPUT_DIR = r"fontstest"
 # 背景颜色
 BACKGROUND_COLOR = (33, 40, 48)
 
