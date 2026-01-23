@@ -11,17 +11,61 @@ import re
 import csv
 import os
 import gc
-from typing import List, Tuple, Dict
+import re
+import cv2
+import numpy as np
+from typing import List, Tuple, Dict, Optional
+# 大模型判断切分行列数（可选）
+ENABLE_LLM_GRID = True  # 是否启用大模型视觉判断行列（影响 mask 生成流程）
+LLM_MAX_COLS = 6  # 发送给大模型的最大列数
+LLM_MAX_ROWS = 6  # 发送给大模型的最大行数
+LLM_MASK_CANNY1 = 60  # mask 生成 Canny 的低阈值（影响 mask 细节）
+LLM_MASK_CANNY2 = 180  # mask 生成 Canny 的高阈值（影响 mask 细节）
+LLM_MASK_CLOSE_K_RATIO = 0.004  # mask 闭运算核宽占图像宽的比例（mask 生成）
+LLM_MASK_DILATE_K_RATIO = 0.002  # mask 膨胀核宽占图像宽的比例（mask 生成）
+MASK_PROJ_Q_BLANK_X = 0.05  # X 方向投影中判断“空白带”的分位数（mask 判定使用）
+MASK_PROJ_Q_BLANK_Y = 0.05  # Y 方向投影中判断“空白带”的分位数（mask 判定使用）
+MASK_PROJ_Q_LINE_X = 0.85  # X 方向投影中判断“线条带”的分位数（mask 判定使用）
+MASK_PROJ_Q_LINE_Y = 0.85  # Y 方向投影中判断“线条带”的分位数（mask 判定使用）
+MASK_PROJ_MIN_BAND_RATIO = 0.003  # 投影带宽必须占图像尺寸的最小比例（mask 判定）
+MASK_PROJ_MIN_PART_RATIO = 0.06  # 切分片段必须占图像尺寸的最小比例（mask 投影使用）
+MASK_PROJ_EDGE_MARGIN_RATIO = 0.01  # 切分线不能太靠近图像边缘占比（mask 判断）
+MASK_LINE_KERNEL_X_RATIO = 0.08  # 默认提取水平长线的核宽比例（mask 判定过滤文字）
+MASK_LINE_KERNEL_Y_RATIO = 0.08  # 默认提取垂直长线的核高比例（mask 判定过滤文字）
+MASK_LINE_KERNEL_X_RATIO_STRUCT = 0.3  # 结构化 mask 提取水平长线的核宽比例（用于 `_infer_layout_from_mask`）
+MASK_LINE_KERNEL_Y_RATIO_STRUCT = 0.3  # 结构化 mask 提取垂直长线的核高比例（用于 `_infer_layout_from_mask`）
+STRUCT_VLINE_COVER_RATIO = 0.1  # 纵向强线需覆盖图像高度的比例（mask 判定以确定强线）
+STRUCT_HLINE_COVER_RATIO = 0.1  # 横向强线需覆盖图像宽度的比例（mask 判定以确定强线）
+MASK_GRID_INTERSECTION_MIN = 12  # grid 交点数判定结构化的最小值
+MASK_GRID_INTERSECTION_RATIO = 0.00008  # grid 交点像素占比
+STRUCT_SNAP_MAX_RATIO = 0.02  # 结构化模式切分线吸附到强线的最大距离占比
+
+# 用于 mask 侧布局分类的线条/强线相关阈值
+LAYOUT_LINE_RATIO_STRUCT = 0.05  # 线条像素占比高于此并有强线才可能是 STRUCTURED
+LAYOUT_LINE_RATIO_TEXT_MAX = 0.08  # 没有强线且线比低于此就判 TEXT_ONLY
+LAYOUT_STRONG_V_MIN = 2  # 判定强纵线时至少需 2 条（辅助 mask 判定）
+LAYOUT_STRONG_H_MIN = 1  # 判定强横线时至少需 1 条（辅助 mask 判定）
+LAYOUT_STRUCT_SCORE_THRESHOLD = 2  # 结构评分的基础值（未直接使用，可保留）
+LAYOUT_STRUCT_STRONG_H_MIN = 1  # 判 STRUCTURED 时需要的最少强横线数量
+LAYOUT_STRUCT_STRONG_V_MIN = 1  # 判 STRUCTURED 时需要的最少强纵线数量
+LAYOUT_STRUCT_AREA_RATIO = 0.10  # 强线面积占比需超过此才能认为是“覆盖大面积”
+LAYOUT_STRUCT_CONFIDENCE_MIN = 0.30  # 结构化置信度最低值（各种因素加权后）
+MASK_CONFIDENCE_THRESHOLD = 0.35  # mask 判定覆盖 LLM 的置信度阈值
+MASK_CONFIDENCE_MIN_OVERRIDE = 0.2  # 置信度稍高时也可以让 mask 结果生效
 from dataclasses import dataclass
 from collections import defaultdict
+
+from llm_call_tool import LlmCaller
+from base64_util import ImageToBase64Converter
+from process_cad_mask import preprocess_mask
 
 # ============================================================================
 # 参数配置
 # ============================================================================
 # 获取脚本所在目录
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-INPUT_DXF_PATH = os.path.join(SCRIPT_DIR, "interest.dxf")
-OUTPUT_DIR = os.path.join(SCRIPT_DIR, "fontstest-2")
+INPUT_DXF_PATH = os.path.join(SCRIPT_DIR, "www.alltoall.net_-6审-住宅设计说明_t3_t3_XsuajLVCMT.dxf")
+OUTPUT_DIR = os.path.join(SCRIPT_DIR, "fontstest-12")
 # INPUT_DXF_PATH = r"interest.dxf"
 # OUTPUT_DIR = r"fontstest"
 # 背景颜色
@@ -49,7 +93,11 @@ TARGET_ROWS = 3                # 每列目标行数
 CUT_OFFSET_X = 200             # 垂直切分点左移距离（DXF单位，mm）
 CUT_OFFSET_Y = -200             # 水平切分点上移距离（DXF单位，mm）
 ENABLE_SPLIT = True          # 是否启用切分功能
-DEBUG_DRAW_LINES = False       # 是否绘制调试线条
+DEBUG_DRAW_LINES = True       # 是否绘制调试线条
+STRUCTURED_FIXED_COLS = 3
+STRUCTURED_FIXED_ROWS = 3
+FORCE_STRUCTURED_FRAMES = set()
+FORCE_TEXT_ONLY_FRAMES = set()
 
 # 大块表格检测配置
 ENABLE_TABLE_MODE = False       # 是否启用表格模式切分（False则只用文字聚类模式）
@@ -146,6 +194,392 @@ class DXFConverter:
                 continue
         else:
             self.western_font = None
+
+    def _infer_grid_from_llm(self, image_path: str) -> Optional[Tuple[int, int, str]]:
+        api_key = os.environ.get("DASHSCOPE_API_KEY", "").strip()
+        if not api_key:
+            return None
+        api_url = os.environ.get("DASHSCOPE_API_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1").strip()
+        model_name = os.environ.get("DASHSCOPE_MODEL", "qwen-vl-max").strip()
+        caller = LlmCaller(api_key=api_key, url=api_url, model_name=model_name)
+
+        img_b64 = ImageToBase64Converter.image_to_base64(image_path, with_data_uri=False)
+        prompt = (
+            "你看到的是一张建筑图框的二值化mask图（白色为线/字，黑色为背景）。\n\n"
+            "任务1：判别布局类型（非常重要）：\n"
+            "- 只有当“规则、密集、长距离贯穿”的横竖线网格覆盖画面主要区域（>35%）时，才判为 type=STRUCTURED。\n"
+            "- 如果只是局部小表格或少量框线，仍判为 type=TEXT_ONLY。\n"
+            "- 如果线条主要是不规则短线/断裂文本行，没有大范围规则网格，判为 type=TEXT_ONLY。\n\n"
+            "任务2：判断主区域分区的列数和行数（用于粗切图）。\n"
+            "重要要求：\n"
+            "1) 只看大的分区边界，忽略表格内部细小格子线。\n"
+            f"2) 列数行数范围在 1~{LLM_MAX_COLS} / 1~{LLM_MAX_ROWS}。\n"
+            "3) 如果不确定，优先输出更少的行列数。\n\n"
+            "输出格式必须严格为：\n"
+            "type=XXX, cols=X, rows=Y"
+        )
+        resp = caller.call(prompt, images_base64=[img_b64], temperature=0.2)
+        if not resp:
+            return None
+        m = re.search(r"type\s*=\s*(\w+)\s*,\s*cols\s*=\s*([1-9][0-9]?)\s*,\s*rows\s*=\s*([1-9][0-9]?)", resp)
+        if m:
+            ltype = m.group(1).upper()
+            cols = int(m.group(2))
+            rows = int(m.group(3))
+        else:
+            m2 = re.search(r"cols\s*=\s*([1-9][0-9]?)\s*,\s*rows\s*=\s*([1-9][0-9]?)", resp)
+            if not m2:
+                return None
+            ltype = "UNKNOWN"
+            cols = int(m2.group(1))
+            rows = int(m2.group(2))
+        cols = max(1, min(LLM_MAX_COLS, cols))
+        rows = max(1, min(LLM_MAX_ROWS, rows))
+        if ltype == "UNKNOWN":
+            print(f"    LLM类型未解析，回退为 UNKNOWN，原始回复: {resp}")
+        return cols, rows, ltype
+
+    def _build_llm_mask(self, full_png_path: str, frame_dir: str) -> Optional[str]:
+        try:
+            img_bgr = cv2.imread(full_png_path, cv2.IMREAD_COLOR)
+            if img_bgr is None:
+                return None
+            mask01 = preprocess_mask(
+                img_bgr,
+                canny1=LLM_MASK_CANNY1,
+                canny2=LLM_MASK_CANNY2,
+                close_k_ratio=LLM_MASK_CLOSE_K_RATIO,
+                dilate_k_ratio=LLM_MASK_DILATE_K_RATIO,
+            )
+            mask_path = os.path.join(frame_dir, "frame_mask01.png")
+            cv2.imwrite(mask_path, mask01 * 255)
+            return mask_path
+        except Exception:
+            return None
+
+    def _find_blank_bands(self, proj: np.ndarray, q_blank: float, min_band_px: int):
+        thr = np.quantile(proj, q_blank)
+        is_blank = proj <= thr
+        bands = []
+        i = 0
+        n = len(is_blank)
+        while i < n:
+            if not is_blank[i]:
+                i += 1
+                continue
+            j = i
+            while j < n and is_blank[j]:
+                j += 1
+            if (j - i) >= min_band_px:
+                bands.append((i, j))
+            i = j
+        return bands
+
+    def _extract_long_lines(self, mask01: np.ndarray,
+                            kx_ratio: Optional[float] = None,
+                            ky_ratio: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray]:
+        h, w = mask01.shape
+        kx = max(15, int(round(w * (kx_ratio if kx_ratio is not None else MASK_LINE_KERNEL_X_RATIO))))
+        ky = max(15, int(round(h * (ky_ratio if ky_ratio is not None else MASK_LINE_KERNEL_Y_RATIO))))
+        if kx % 2 == 0:
+            kx += 1
+        if ky % 2 == 0:
+            ky += 1
+        kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (kx, 1))
+        kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, ky))
+        h_lines = cv2.morphologyEx(mask01, cv2.MORPH_OPEN, kernel_h, iterations=1)
+        v_lines = cv2.morphologyEx(mask01, cv2.MORPH_OPEN, kernel_v, iterations=1)
+        return h_lines, v_lines
+
+    def _infer_layout_from_mask(self, mask_path: str) -> Tuple[str, float]:
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            return "STRUCTURED", 1.0
+        mask01 = (mask > 0).astype(np.uint8) * 255
+        h, w = mask01.shape
+        h_lines, v_lines = self._extract_long_lines(
+            mask01,
+            kx_ratio=MASK_LINE_KERNEL_X_RATIO_STRUCT,
+            ky_ratio=MASK_LINE_KERNEL_Y_RATIO_STRUCT
+        )
+        line_pixels = int((h_lines > 0).sum() + (v_lines > 0).sum())
+        mask_pixels = int((mask01 > 0).sum())
+        line_ratio = line_pixels / max(1, mask_pixels)
+
+        min_band_x = max(3, int(round(w * MASK_PROJ_MIN_BAND_RATIO)))
+        min_band_y = max(3, int(round(h * MASK_PROJ_MIN_BAND_RATIO)))
+        v_strength = (v_lines > 0).sum(axis=0)
+        h_strength = (h_lines > 0).sum(axis=1)
+        min_v_cover = int(round(h * STRUCT_VLINE_COVER_RATIO))
+        min_h_cover = int(round(w * STRUCT_HLINE_COVER_RATIO))
+
+        strong_v = self._find_strong_line_bands(v_strength, min_v_cover, min_band_x)
+        strong_h = self._find_strong_line_bands(h_strength, min_h_cover, min_band_y)
+
+        strong_mask = cv2.bitwise_or(h_lines, v_lines)
+        strong_area_pixels = int((strong_mask > 0).sum())
+        strong_area_ratio = strong_area_pixels / max(1, h * w)
+        intersections = cv2.bitwise_and(h_lines, v_lines)
+        num_grid_nodes, intersection_pixels = self._count_grid_intersections(intersections)
+        intersection_ratio = intersection_pixels / max(1, h * w)
+
+        has_sufficient_lines = (
+            len(strong_h) >= LAYOUT_STRUCT_STRONG_H_MIN
+            and len(strong_v) >= LAYOUT_STRUCT_STRONG_V_MIN
+        )
+
+        struct_strength = strong_area_ratio * 0.6 + line_ratio * 0.4
+        confidence = min(1.0, struct_strength + 0.1)
+        print(
+            f"    Mask布局统计: strong_h={len(strong_h)}, strong_v={len(strong_v)}, "
+            f"strong_area_ratio={strong_area_ratio:.3f}, line_ratio={line_ratio:.3f}, "
+            f"struct_strength={struct_strength:.3f}, has_sufficient_lines={has_sufficient_lines}, "
+            f"grid_nodes={num_grid_nodes}, grid_ratio={intersection_ratio:.5f}"
+        )
+        if (
+            has_sufficient_lines
+            and struct_strength >= LAYOUT_STRUCT_CONFIDENCE_MIN
+            and strong_area_ratio >= LAYOUT_STRUCT_AREA_RATIO
+        ):
+            return "STRUCTURED", confidence
+
+        grid_trigger = (
+            num_grid_nodes >= MASK_GRID_INTERSECTION_MIN
+            and intersection_ratio >= MASK_GRID_INTERSECTION_RATIO
+            and line_ratio >= 0.25
+        )
+        if grid_trigger:
+            print("    Mask网格交点触发结构化策略")
+            return "STRUCTURED", min(1.0, confidence + 0.1)
+
+        if len(strong_v) == 0 and len(strong_h) == 0 and line_ratio <= LAYOUT_LINE_RATIO_TEXT_MAX:
+            return "TEXT_ONLY", max(0.2, 1 - strong_area_ratio)
+
+        return "TEXT_ONLY", max(0.1, min(0.9, 1 - strong_area_ratio))
+
+    def _count_grid_intersections(self, intersections: np.ndarray) -> Tuple[int, int]:
+        if intersections is None or intersections.size == 0:
+            return 0, 0
+        mask_bin = (intersections > 0).astype(np.uint8)
+        if mask_bin.sum() == 0:
+            return 0, 0
+        num_labels, _, _, _ = cv2.connectedComponentsWithStats(mask_bin, connectivity=8)
+        return max(0, num_labels - 1), int(mask_bin.sum())
+
+    def _choose_cuts_from_bands(self, bands, max_cuts, min_part_px, length, edge_margin_px):
+        if not bands or max_cuts <= 0:
+            return []
+        bands = sorted(
+            bands,
+            key=lambda b: (-(b[1] - b[0]), abs((b[0] + b[1]) / 2 - length / 2))
+        )
+        cuts = []
+        for b0, b1 in bands:
+            c = int(round((b0 + b1) / 2))
+            if c <= edge_margin_px or c >= length - edge_margin_px:
+                continue
+            cuts.append(c)
+            cuts = sorted(set(cuts))
+            pts = [0] + cuts + [length]
+            ok = all((pts[i + 1] - pts[i]) >= min_part_px for i in range(len(pts) - 1))
+            if not ok:
+                cuts.remove(c)
+            if len(cuts) >= max_cuts:
+                break
+        return cuts
+
+    def _merge_uniform_cuts(self, cuts, target_cuts, length):
+        if target_cuts <= 0:
+            return []
+        uniform = [int(round(length * i / (target_cuts + 1))) for i in range(1, target_cuts + 1)]
+        merged = sorted(set(cuts + uniform))
+        if len(merged) < target_cuts:
+            return uniform[:target_cuts]
+        if len(merged) <= target_cuts:
+            return merged
+        # 选择最接近均匀位置的切分点
+        picked = []
+        for u in uniform:
+            nearest = min(merged, key=lambda c: abs(c - u))
+            picked.append(nearest)
+        picked = sorted(set(picked))
+        if len(picked) < target_cuts:
+            return uniform[:target_cuts]
+        return picked[:target_cuts]
+
+    def _find_line_bands(self, proj: np.ndarray, q_line: float, min_band_px: int):
+        thr = np.quantile(proj, q_line)
+        is_line = proj >= thr
+        bands = []
+        i = 0
+        n = len(is_line)
+        while i < n:
+            if not is_line[i]:
+                i += 1
+                continue
+            j = i
+            while j < n and is_line[j]:
+                j += 1
+            if (j - i) >= min_band_px:
+                bands.append((i, j))
+            i = j
+        return bands
+
+    def _find_strong_line_bands(self, proj: np.ndarray, min_cover_px: int, min_band_px: int):
+        is_line = proj >= min_cover_px
+        bands = []
+        i = 0
+        n = len(is_line)
+        while i < n:
+            if not is_line[i]:
+                i += 1
+                continue
+            j = i
+            while j < n and is_line[j]:
+                j += 1
+            if (j - i) >= min_band_px:
+                bands.append((i, j))
+            i = j
+        return bands
+
+    def _snap_cuts_to_bands(self, cuts, bands, max_dist_px):
+        if not cuts or not bands:
+            return cuts
+        centers = [int(round((b0 + b1) / 2)) for b0, b1 in bands]
+        snapped = []
+        for cut in cuts:
+            nearest = min(centers, key=lambda c: abs(c - cut))
+            if abs(nearest - cut) <= max_dist_px:
+                snapped.append(nearest)
+            else:
+                snapped.append(cut)
+        return sorted(set(snapped))
+
+    def _infer_mask_cuts(self, mask_path: str, target_cols: int, target_rows: int, layout_type: str = "STRUCTURED"):
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            return None
+        mask01 = (mask > 0).astype(np.uint8) * 255
+        h, w = mask01.shape
+
+        # 策略 A: TEXT_ONLY -> 找空白缝隙
+        # 策略 B: STRUCTURED -> 找长直线
+        if layout_type == "STRUCTURED":
+            # 提取长直线（水平/垂直分离），使用更强的核抑制文字
+            h_lines, v_lines = self._extract_long_lines(
+                mask01,
+                kx_ratio=MASK_LINE_KERNEL_X_RATIO_STRUCT,
+                ky_ratio=MASK_LINE_KERNEL_Y_RATIO_STRUCT
+            )
+            find_func = self._find_line_bands
+            q_x = MASK_PROJ_Q_LINE_X
+            q_y = MASK_PROJ_Q_LINE_Y
+        else:
+            # 纯文字，使用原 mask
+            h_lines, v_lines = mask01, mask01
+            find_func = self._find_blank_bands
+            q_x = MASK_PROJ_Q_BLANK_X
+            q_y = MASK_PROJ_Q_BLANK_Y
+
+        v_strength = (v_lines > 0).sum(axis=0)
+        proj_x = v_strength
+        min_band_x = max(3, int(round(w * MASK_PROJ_MIN_BAND_RATIO)))
+        min_band_y = max(3, int(round(h * MASK_PROJ_MIN_BAND_RATIO)))
+        min_part_x = max(50, int(round(w * MASK_PROJ_MIN_PART_RATIO)))
+        min_part_y = max(50, int(round(h * MASK_PROJ_MIN_PART_RATIO)))
+        edge_margin_x = int(round(w * MASK_PROJ_EDGE_MARGIN_RATIO))
+        edge_margin_y = int(round(h * MASK_PROJ_EDGE_MARGIN_RATIO))
+
+        if layout_type == "STRUCTURED":
+            min_v_cover = int(round(h * STRUCT_VLINE_COVER_RATIO))
+            bands_x = self._find_strong_line_bands(v_strength, min_v_cover, min_band_x)
+            if not bands_x:
+                bands_x = self._find_line_bands(v_strength, q_x, min_band_x)
+        else:
+            bands_x = find_func(proj_x, q_x, min_band_x)
+
+        cuts_x = self._choose_cuts_from_bands(
+            bands_x, max(0, target_cols - 1), min_part_x, w, edge_margin_x
+        )
+        if layout_type == "STRUCTURED" and bands_x:
+            snap_dist = int(round(w * STRUCT_SNAP_MAX_RATIO))
+            cuts_x = self._snap_cuts_to_bands(cuts_x, bands_x, snap_dist)
+        if layout_type == "STRUCTURED" and not bands_x:
+            # 结构图没有识别到明确竖线时，不强行补刀，避免切断文字
+            cuts_x = []
+        if target_cols > 1 and len(cuts_x) < target_cols - 1 and not (layout_type == "STRUCTURED" and not bands_x):
+            cuts_x = self._merge_uniform_cuts(cuts_x, target_cols - 1, w)
+
+        x_pts = [0] + sorted(cuts_x) + [w]
+        cuts_y_per_col = []
+        for i in range(len(x_pts) - 1):
+            x0, x1 = x_pts[i], x_pts[i + 1]
+            if x1 <= x0:
+                cuts_y_per_col.append([])
+                continue
+            h_strength = (h_lines[:, x0:x1] > 0).sum(axis=1)
+            proj_y = h_strength
+            if layout_type == "STRUCTURED":
+                min_h_cover = int(round((x1 - x0) * STRUCT_HLINE_COVER_RATIO))
+                bands_y = self._find_strong_line_bands(h_strength, min_h_cover, min_band_y)
+                if not bands_y:
+                    bands_y = self._find_line_bands(h_strength, q_y, min_band_y)
+            else:
+                bands_y = find_func(proj_y, q_y, min_band_y)
+            cuts_y = self._choose_cuts_from_bands(
+                bands_y, max(0, target_rows - 1), min_part_y, h, edge_margin_y
+            )
+            if layout_type == "STRUCTURED" and bands_y:
+                snap_dist_y = int(round(h * STRUCT_SNAP_MAX_RATIO))
+                cuts_y = self._snap_cuts_to_bands(cuts_y, bands_y, snap_dist_y)
+            # 智能补刀：如果是结构图，且完全没找到横线，可能不需要切（如附栏）
+            if layout_type == "STRUCTURED":
+                if not bands_y:
+                    cuts_y = []
+                # 如果没找到任何线，且本来就只要切少数几刀，就不补刀了
+                if not cuts_y and target_rows <= 2:
+                    pass
+                elif len(cuts_y) < target_rows - 1:
+                    cuts_y = self._merge_uniform_cuts(cuts_y, target_rows - 1, h)
+            else:
+                # 纯文字模式，如果没找到空白带，还是要补刀（防止图太大）
+                if len(cuts_y) < target_rows - 1:
+                    cuts_y = self._merge_uniform_cuts(cuts_y, target_rows - 1, h)
+            
+            cuts_y_per_col.append(cuts_y)
+
+        return cuts_x, cuts_y_per_col, w, h
+
+    def _build_boundaries_from_mask(self, mask_path: str, frame_x_min, frame_x_max,
+                                    frame_y_min, frame_y_max, scale,
+                                    target_cols: int, target_rows: int, layout_type: str = "STRUCTURED"):
+        inferred = self._infer_mask_cuts(mask_path, target_cols, target_rows, layout_type)
+        if not inferred:
+            return None
+        cuts_x_px, cuts_y_px_per_col, w, h = inferred
+
+        def px_to_dxf_x(px):
+            return frame_x_min + px / scale
+
+        def px_to_dxf_y(px):
+            return frame_y_max - px / scale
+
+        col_boundaries = [frame_x_min]
+        for cut_px in sorted(cuts_x_px):
+            col_boundaries.append(px_to_dxf_x(cut_px))
+        col_boundaries.append(frame_x_max)
+
+        col_boundaries = sorted(set(col_boundaries))
+        row_boundaries_per_col = []
+        for cuts_y_px in cuts_y_px_per_col:
+            row_boundaries = [frame_y_max]
+            for cut_px in sorted(cuts_y_px):
+                row_boundaries.append(px_to_dxf_y(cut_px))
+            row_boundaries.append(frame_y_min)
+            row_boundaries = sorted(set(row_boundaries), reverse=True)
+            row_boundaries_per_col.append(row_boundaries)
+
+        return col_boundaries, row_boundaries_per_col, cuts_x_px, cuts_y_px_per_col
     
     def _get_font(self, size, is_chinese):
         scale = CHINESE_FONT_SCALE if is_chinese else WESTERN_FONT_SCALE
@@ -670,7 +1104,7 @@ class DXFConverter:
                         self._collect_texts_recursive(nested_block, nix, niy, nsx, nsy, texts, depth + 1)
             except:
                 pass
-    
+
     def _collect_texts_for_filter(self, block, offset_x, offset_y, scale_x, scale_y, text_x, text_y, depth=0):
         """递归收集块内文字坐标（用于过滤异常坐标）"""
         if depth > 10:
@@ -838,8 +1272,9 @@ class DXFConverter:
             except:
                 continue
     
-    def _calculate_split_boundaries(self, positions, frame_x_min, frame_x_max, 
-                                     frame_y_min, frame_y_max, frame=None):
+    def _calculate_split_boundaries(self, positions, frame_x_min, frame_x_max,
+                                     frame_y_min, frame_y_max, frame=None,
+                                     cluster_only: bool = False):
         """基于文字起始位置密度计算切分边界
         
         逻辑顺序：
@@ -847,45 +1282,48 @@ class DXFConverter:
         2. 优先检测大块表格，如果存在则使用表格模式切分
         3. 否则使用文字密度聚类模式
         """
-        # 1. 手动切分点
-        if MANUAL_CUT_X:
-            print(f"    使用手动切分点: {MANUAL_CUT_X}")
-            col_boundaries = [frame_x_min] + list(MANUAL_CUT_X) + [frame_x_max]
-            # 收集线段用于横向切分
-            h_segments = []
-            v_segments = []
-            block = self.doc.blocks.get(self.frame_block_name)
-            if block and frame:
-                for entity in self.msp:
-                    if entity.dxftype() == 'INSERT' and entity.dxf.name == self.frame_block_name:
-                        ix, iy = entity.dxf.insert.x, entity.dxf.insert.y
-                        sx = getattr(entity.dxf, 'xscale', 1.0)
-                        sy = getattr(entity.dxf, 'yscale', 1.0)
-                        self._collect_lines_recursive(block, ix, iy, sx, sy, h_segments, v_segments, 0)
-                        break
-            row_boundaries_per_col = self._calculate_table_row_boundaries(
-                col_boundaries, frame_y_min, frame_y_max, h_segments)
-            return col_boundaries, row_boundaries_per_col
-        
-        # 2. 如果启用表格模式，优先检测大块表格
-        if ENABLE_TABLE_MODE:
-            has_table, tables, v_segments, h_segments = self._detect_large_table(
-                frame_x_min, frame_x_max, frame_y_min, frame_y_max)
-            
-            if has_table and frame:
-                print(f"    检测到大块表格，启用表格模式切分...")
-                # 使用表格边界线切分
-                table_cuts = self._find_table_vertical_cut_lines(frame, v_segments, tables)
-                if table_cuts:
-                    print(f"    表格模式纵向切分线: {[f'{x:.0f}' for x in table_cuts]}")
-                    col_boundaries = [frame_x_min] + table_cuts + [frame_x_max]
-                    row_boundaries_per_col = self._calculate_table_row_boundaries(
-                        col_boundaries, frame_y_min, frame_y_max, h_segments)
-                    return col_boundaries, row_boundaries_per_col
-                else:
-                    print(f"    表格模式未找到有效切分线，回退到聚类模式")
+        if not cluster_only:
+            # 1. 手动切分点
+            if MANUAL_CUT_X:
+                print(f"    使用手动切分点: {MANUAL_CUT_X}")
+                col_boundaries = [frame_x_min] + list(MANUAL_CUT_X) + [frame_x_max]
+                # 收集线段用于横向切分
+                h_segments = []
+                v_segments = []
+                block = self.doc.blocks.get(self.frame_block_name)
+                if block and frame:
+                    for entity in self.msp:
+                        if entity.dxftype() == 'INSERT' and entity.dxf.name == self.frame_block_name:
+                            ix, iy = entity.dxf.insert.x, entity.dxf.insert.y
+                            sx = getattr(entity.dxf, 'xscale', 1.0)
+                            sy = getattr(entity.dxf, 'yscale', 1.0)
+                            self._collect_lines_recursive(block, ix, iy, sx, sy, h_segments, v_segments, 0)
+                            break
+                row_boundaries_per_col = self._calculate_table_row_boundaries(
+                    col_boundaries, frame_y_min, frame_y_max, h_segments)
+                return col_boundaries, row_boundaries_per_col
+
+            # 2. 如果启用表格模式，优先检测大块表格
+            if ENABLE_TABLE_MODE:
+                has_table, tables, v_segments, h_segments = self._detect_large_table(
+                    frame_x_min, frame_x_max, frame_y_min, frame_y_max)
+                
+                if has_table and frame:
+                    print(f"    检测到大块表格，启用表格模式切分...")
+                    # 使用表格边界线切分
+                    table_cuts = self._find_table_vertical_cut_lines(frame, v_segments, tables)
+                    if table_cuts:
+                        print(f"    表格模式纵向切分线: {[f'{x:.0f}' for x in table_cuts]}")
+                        col_boundaries = [frame_x_min] + table_cuts + [frame_x_max]
+                        row_boundaries_per_col = self._calculate_table_row_boundaries(
+                            col_boundaries, frame_y_min, frame_y_max, h_segments)
+                        return col_boundaries, row_boundaries_per_col
+                    else:
+                        print(f"    表格模式未找到有效切分线，回退到聚类模式")
+            else:
+                print(f"    表格模式已禁用，使用文字聚类模式")
         else:
-            print(f"    表格模式已禁用，使用文字聚类模式")
+            print(f"    聚类模式(忽略表格/手动切分)")
         
         # 3. 文字密度聚类模式（原有逻辑）- 只关注文字，不受表格竖线影响
         # 收集所有文字的起始X位置，按100mm分桶统计
@@ -970,9 +1408,9 @@ class DXFConverter:
         
         return col_boundaries, row_boundaries_per_col
     
-    def _draw_debug_lines(self, draw, image, frame_x_min, frame_x_max, 
+    def _draw_debug_lines(self, draw, image, frame_x_min, frame_x_max,
                           frame_y_min, frame_y_max, scale, col_boundaries,
-                          x_starts_unique):
+                          x_starts_unique, mask_cuts_px=None):
         """绘制调试线条：文字起始位置和切分线"""
         
         img_height = image.height
@@ -983,39 +1421,35 @@ class DXFConverter:
         def dxf_y_to_img(dxf_y):
             return int((frame_y_max - dxf_y) * scale)
         
-        # 绘制文字起始位置的竖线（蓝色细线）
-        for x in x_starts_unique:
-            img_x = dxf_x_to_img(x)
-            if 0 <= img_x < image.width:
-                # 画蓝色细线
-                draw.line([(img_x, 0), (img_x, img_height)], fill=(0, 100, 255), width=1)
-        
         # 绘制切分线（红色粗线）并标注坐标
         font = self._get_font(24, False)
         for i, cut_x in enumerate(col_boundaries[1:-1], 1):  # 跳过首尾边界
             img_x = dxf_x_to_img(cut_x)
             if 0 <= img_x < image.width:
                 # 画红色粗线
-                draw.line([(img_x, 0), (img_x, img_height)], fill=(255, 0, 0), width=3)
+                draw.line([(img_x, 0), (img_x, img_height)], fill=(255, 0, 0), width=6)
                 # 标注X坐标
                 label = f"CUT{i}: X={cut_x:.0f}"
                 draw.text((img_x + 5, 30 + i * 40), label, font=font, fill=(255, 0, 0))
-        
-        # 在图片底部标注一些关键的文字起始X坐标
-        if x_starts_unique:
-            x_list = sorted(x_starts_unique)
-            cluster_starts = [x_list[0]]  # 第一个
-            for i in range(1, len(x_list)):
-                if x_list[i] - x_list[i-1] > 1000:  # 间隙大于1000mm视为新聚类
-                    cluster_starts.append(x_list[i])
-            
-            # 绘制聚类起始位置的标注（绿色）
-            for x in cluster_starts[:10]:  # 最多标注10个
-                img_x = dxf_x_to_img(x)
-                if 0 <= img_x < image.width:
-                    draw.line([(img_x, 0), (img_x, img_height)], fill=(0, 255, 0), width=2)
-                    label = f"X={x:.0f}"
-                    draw.text((img_x + 5, img_height - 60), label, font=font, fill=(0, 255, 0))
+
+        # 绘制 mask 投影切线（黄色）
+        if mask_cuts_px:
+            mask_cuts_x, mask_cuts_y_per_col = mask_cuts_px
+            for i, cut_x in enumerate(sorted(mask_cuts_x), 1):
+                if 0 <= cut_x < image.width:
+                    draw.line([(cut_x, 0), (cut_x, img_height)], fill=(255, 200, 0), width=5)
+                    label = f"MASK_X{i}"
+                    draw.text((cut_x + 5, 10 + i * 30), label, font=font, fill=(255, 200, 0))
+            x_pts = [0] + sorted(mask_cuts_x) + [image.width]
+            for col_idx, cuts_y in enumerate(mask_cuts_y_per_col):
+                if col_idx >= len(x_pts) - 1:
+                    break
+                x0, x1 = x_pts[col_idx], x_pts[col_idx + 1]
+                for i, cut_y in enumerate(sorted(cuts_y), 1):
+                    if 0 <= cut_y < image.height:
+                        draw.line([(x0, cut_y), (x1, cut_y)], fill=(255, 200, 0), width=5)
+                        label = f"MASK_Y{col_idx+1}-{i}"
+                        draw.text((x0 + 5, cut_y + 5), label, font=font, fill=(255, 200, 0))
     
     def _collect_text_x_starts(self, frame_x_min, frame_x_max, frame_y_min, frame_y_max):
         """收集所有文字的起始X坐标（包括块内的文字）"""
@@ -1132,10 +1566,11 @@ class DXFConverter:
             row_boundaries.append(frame_y_min)
             
             # 如果没找到足够的切分线，用等分
-            if len(row_boundaries) < TARGET_ROWS + 1:
-                row_height = (frame_y_max - frame_y_min) / TARGET_ROWS
+            default_rows = TARGET_ROWS if TARGET_ROWS is not None else 3
+            if len(row_boundaries) < default_rows + 1:
+                row_height = (frame_y_max - frame_y_min) / default_rows
                 row_boundaries = [frame_y_max]
-                for j in range(1, TARGET_ROWS):
+                for j in range(1, default_rows):
                     row_boundaries.append(frame_y_max - j * row_height)
                 row_boundaries.append(frame_y_min)
             
@@ -1617,6 +2052,7 @@ class DXFConverter:
                 curr_x += seg['width']
     
     def render_frame(self, frame: FrameInfo):
+        global TARGET_COLS, TARGET_ROWS
         print(f"\n渲染图框 #{frame.index}...")
         
         frame_dir = os.path.join(OUTPUT_DIR, f"frame_{frame.index}")
@@ -1652,15 +2088,7 @@ class DXFConverter:
         drawn_boxes = []
         line_width = max(1, int(scale * 0.18))
         
-        # 计算切分边界
-        print(f"    计算切分边界 ({TARGET_COLS}列 x {TARGET_ROWS}行)...")
-        col_boundaries, row_boundaries_per_col = self._calculate_split_boundaries(
-            None, x_min, x_max, y_min, y_max, frame)
-        
-        # 打印列边界信息
-        col_widths = [col_boundaries[i+1] - col_boundaries[i] for i in range(len(col_boundaries)-1)]
-        print(f"    列边界: {[f'{b:.0f}' for b in col_boundaries]}")
-        print(f"    列宽度: {[f'{w:.0f}' for w in col_widths]}")
+        # （切分边界计算移动到保存完整PNG之后进行）
         
         # 绘制图框块
         self._draw_block(draw, image, self.frame_block_name,
@@ -1811,9 +2239,80 @@ class DXFConverter:
         x_starts_unique = self._collect_text_x_starts(x_min, x_max, y_min, y_max)
         print(f"    文字起始X坐标数量: {len(x_starts_unique)}")
         
+        # 大模型判断行列数（可选）
+        inferred_cols = None
+        inferred_rows = None
+        inferred_type = "UNKNOWN"
+        llm_mask_path = None
+        if ENABLE_LLM_GRID:
+            llm_mask_path = self._build_llm_mask(full_png_path, frame_dir)
+            if llm_mask_path:
+                inferred = self._infer_grid_from_llm(llm_mask_path)
+                if inferred:
+                    inferred_cols, inferred_rows, inferred_type = inferred
+
+        mask_layout = None
+        mask_confidence = 0.0
+        if llm_mask_path:
+            mask_layout, mask_confidence = self._infer_layout_from_mask(llm_mask_path)
+
+        # 手动覆盖（按帧号优先）
+        if frame.index in FORCE_STRUCTURED_FRAMES:
+            inferred_type = "STRUCTURED"
+        elif frame.index in FORCE_TEXT_ONLY_FRAMES:
+            inferred_type = "TEXT_ONLY"
+        else:
+            # 双向校正：LLM 为主，强mask可覆盖
+            if mask_layout and mask_confidence >= MASK_CONFIDENCE_THRESHOLD:
+                inferred_type = mask_layout
+            elif mask_layout and mask_confidence >= MASK_CONFIDENCE_MIN_OVERRIDE:
+                inferred_type = mask_layout
+            elif inferred_type not in ("TEXT_ONLY", "STRUCTURED"):
+                inferred_type = mask_layout if mask_layout else "STRUCTURED"
+            else:
+                if inferred_type == "STRUCTURED" and mask_layout == "TEXT_ONLY" and mask_confidence >= 0.3:
+                    inferred_type = "TEXT_ONLY"
+                elif inferred_type == "TEXT_ONLY" and mask_layout == "STRUCTURED" and mask_confidence >= 0.3:
+                    inferred_type = "STRUCTURED"
+
+        # 统一使用的目标行列数
+        effective_cols = inferred_cols if inferred_cols else TARGET_COLS
+        effective_rows = inferred_rows if inferred_rows else TARGET_ROWS
+        use_structured_fixed = inferred_type == "STRUCTURED"
+        if use_structured_fixed:
+            effective_cols = STRUCTURED_FIXED_COLS
+            effective_rows = STRUCTURED_FIXED_ROWS
+
+        # 临时覆盖全局切分参数（仅用于本图框切分）
+        orig_cols, orig_rows = TARGET_COLS, TARGET_ROWS
+        TARGET_COLS = effective_cols
+        TARGET_ROWS = effective_rows
+        if inferred_cols and inferred_rows:
+            print(f"    LLM切分: {TARGET_COLS}列 x {TARGET_ROWS}行 (类型: {inferred_type})")
+        if use_structured_fixed:
+            print(f"    STRUCTURED 固定切分: {TARGET_COLS}列 x {TARGET_ROWS}行 (使用 fontstest-1 逻辑)")
+
+        # 优先使用 mask 投影定位切分线
+        mask_boundaries = None
+        mask_cuts_px = None
+        if llm_mask_path and not use_structured_fixed:
+            mask_boundaries = self._build_boundaries_from_mask(
+                llm_mask_path, x_min, x_max, y_min, y_max, scale,
+                target_cols=effective_cols, target_rows=effective_rows,
+                layout_type=inferred_type
+            )
+            if mask_boundaries:
+                mask_cuts_px = (mask_boundaries[2], mask_boundaries[3])
+                print(f"    Mask投影切分: {effective_cols}列 x {effective_rows}行 (策略: {inferred_type})")
+
         # 计算切分边界
-        col_boundaries, row_boundaries_per_col = self._calculate_split_boundaries(
-            None, x_min, x_max, y_min, y_max, frame)
+        print(f"    计算切分边界 ({TARGET_COLS}列 x {TARGET_ROWS}行)...")
+        if mask_boundaries:
+            col_boundaries, row_boundaries_per_col = mask_boundaries[:2]
+        else:
+            col_boundaries, row_boundaries_per_col = self._calculate_split_boundaries(
+                None, x_min, x_max, y_min, y_max, frame,
+                cluster_only=use_structured_fixed)
         
         # 打印列边界信息
         col_widths = [col_boundaries[i+1] - col_boundaries[i] for i in range(len(col_boundaries)-1)]
@@ -1823,11 +2322,14 @@ class DXFConverter:
         # 绘制调试线条
         if DEBUG_DRAW_LINES:
             print(f"    绘制调试线条...")
-            self._draw_debug_lines(draw, image, x_min, x_max, y_min, y_max, 
-                                  scale, col_boundaries, x_starts_unique)
-            # 重新保存带调试线条的图片
+            debug_image = image.copy()
+            debug_draw = ImageDraw.Draw(debug_image)
+            self._draw_debug_lines(debug_draw, debug_image, x_min, x_max, y_min, y_max,
+                                  scale, col_boundaries, x_starts_unique,
+                                  mask_cuts_px=mask_cuts_px)
+            # 保存带调试线条的图片（仅 debug 图）
             debug_png_path = os.path.join(frame_dir, f"frame_{frame.index}_debug.png")
-            image.save(debug_png_path, 'PNG', dpi=(OUTPUT_DPI, OUTPUT_DPI))
+            debug_image.save(debug_png_path, 'PNG', dpi=(OUTPUT_DPI, OUTPUT_DPI))
             print(f"  调试PNG: {debug_png_path}")
         
         # 切分并保存（如果启用）
@@ -1839,6 +2341,9 @@ class DXFConverter:
         else:
             print(f"  切分功能已禁用")
         
+        # 恢复全局切分参数
+        TARGET_COLS, TARGET_ROWS = orig_cols, orig_rows
+
         # 保存CSV
         csv_path = os.path.join(frame_dir, f"frame_{frame.index}_texts.csv")
         text_data.sort(key=lambda t: (-t['y'], t['x']))
