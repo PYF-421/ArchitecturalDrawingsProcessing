@@ -24,7 +24,7 @@ LLM_MASK_CANNY2 = 180  # mask 生成 Canny 的高阈值（影响 mask 细节）
 LLM_MASK_CLOSE_K_RATIO = 0.004  # mask 闭运算核宽占图像宽的比例（mask 生成）
 LLM_MASK_DILATE_K_RATIO = 0.002  # mask 膨胀核宽占图像宽的比例（mask 生成）
 MASK_PROJ_Q_BLANK_X = 0.05  # X 方向投影中判断“空白带”的分位数（mask 判定使用）
-MASK_PROJ_Q_BLANK_Y = 0.05  # Y 方向投影中判断“空白带”的分位数（mask 判定使用）
+MASK_PROJ_Q_BLANK_Y = 0.02  # Y 方向投影中判断“空白带”的分位数（mask 判定使用）
 MASK_PROJ_Q_LINE_X = 0.85  # X 方向投影中判断“线条带”的分位数（mask 判定使用）
 MASK_PROJ_Q_LINE_Y = 0.85  # Y 方向投影中判断“线条带”的分位数（mask 判定使用）
 MASK_PROJ_MIN_BAND_RATIO = 0.003  # 投影带宽必须占图像尺寸的最小比例（mask 判定）
@@ -32,8 +32,10 @@ MASK_PROJ_MIN_PART_RATIO = 0.06  # 切分片段必须占图像尺寸的最小比
 MASK_PROJ_EDGE_MARGIN_RATIO = 0.01  # 切分线不能太靠近图像边缘占比（mask 判断）
 MASK_LINE_KERNEL_X_RATIO = 0.08  # 默认提取水平长线的核宽比例（mask 判定过滤文字）
 MASK_LINE_KERNEL_Y_RATIO = 0.08  # 默认提取垂直长线的核高比例（mask 判定过滤文字）
-MASK_LINE_KERNEL_X_RATIO_STRUCT = 0.3  # 结构化 mask 提取水平长线的核宽比例（用于 `_infer_layout_from_mask`）
-MASK_LINE_KERNEL_Y_RATIO_STRUCT = 0.3  # 结构化 mask 提取垂直长线的核高比例（用于 `_infer_layout_from_mask`）
+MASK_LINE_KERNEL_X_RATIO_STRUCT = 0.3  # 结构化 mask 提取水平长线的核宽比例（用于布局判别）
+MASK_LINE_KERNEL_Y_RATIO_STRUCT = 0.3  # 结构化 mask 提取垂直长线的核高比例（用于布局判别）
+MASK_LINE_KERNEL_X_RATIO_CUT = 0.10    # 切分时提取水平长线的核宽比例（较短，用于切分定位）
+MASK_LINE_KERNEL_Y_RATIO_CUT = 0.10    # 切分时提取垂直长线的核高比例（较短，用于切分定位）
 STRUCT_VLINE_COVER_RATIO = 0.1  # 纵向强线需覆盖图像高度的比例（mask 判定以确定强线）
 STRUCT_HLINE_COVER_RATIO = 0.1  # 横向强线需覆盖图像宽度的比例（mask 判定以确定强线）
 MASK_GRID_INTERSECTION_MIN = 12  # grid 交点数判定结构化的最小值
@@ -64,8 +66,8 @@ from process_cad_mask import preprocess_mask
 # ============================================================================
 # 获取脚本所在目录
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-INPUT_DXF_PATH = os.path.join(SCRIPT_DIR, "www.alltoall.net_-6审-住宅设计说明_t3_t3_XsuajLVCMT.dxf")
-OUTPUT_DIR = os.path.join(SCRIPT_DIR, "fontstest-12")
+INPUT_DXF_PATH = os.path.join(SCRIPT_DIR, "www.alltoall.net_-3审-设计说明20230226_t3_w2tZ16eNms.dxf")
+OUTPUT_DIR = os.path.join(SCRIPT_DIR, "fontstest-20STRUCTURED")
 # INPUT_DXF_PATH = r"interest.dxf"
 # OUTPUT_DIR = r"fontstest"
 # 背景颜色
@@ -89,13 +91,15 @@ MAX_IMAGE_DIMENSION = 12000
 
 # 切分设置
 TARGET_COLS = 3                # 目标列数
-TARGET_ROWS = 3                # 每列目标行数
+TARGET_ROWS = 3                # 每列目标行数（用于TEXT_ONLY类型）
+TEXT_ONLY_MAX_COLS = 3        # TEXT_ONLY类型的最大列数限制（防止切分过细）
+TEXT_ONLY_MAX_ROWS = 1        # TEXT_ONLY类型的最大行数限制（设为1表示不横向切，避免打乱阅读顺序）
 CUT_OFFSET_X = 200             # 垂直切分点左移距离（DXF单位，mm）
 CUT_OFFSET_Y = -200             # 水平切分点上移距离（DXF单位，mm）
 ENABLE_SPLIT = True          # 是否启用切分功能
 DEBUG_DRAW_LINES = True       # 是否绘制调试线条
 STRUCTURED_FIXED_COLS = 3
-STRUCTURED_FIXED_ROWS = 3
+STRUCTURED_FIXED_ROWS = 1    # 设为1表示不进行横向切分
 FORCE_STRUCTURED_FRAMES = set()
 FORCE_TEXT_ONLY_FRAMES = set()
 
@@ -104,6 +108,7 @@ ENABLE_TABLE_MODE = False       # 是否启用表格模式切分（False则只�
 TABLE_SIZE_THRESHOLD = 0.7     # 大块表格尺寸阈值（占图框宽或高的比例）
 MANUAL_CUT_X = None            # 手动指定纵向切分点，例如: [32700, 56700, 82500]
 MANUAL_CUT_Y = None            # 手动指定横向切分点
+EXCLUDE_RIGHT_TITLEBAR_WIDTH = 7800  # 排除右侧图框栏的宽度（DXF单位，mm）设为0则不排除
 
 # ============================================================================
 # CAD特殊符号替换表
@@ -211,10 +216,13 @@ class DXFConverter:
             "- 如果只是局部小表格或少量框线，仍判为 type=TEXT_ONLY。\n"
             "- 如果线条主要是不规则短线/断裂文本行，没有大范围规则网格，判为 type=TEXT_ONLY。\n\n"
             "任务2：判断主区域分区的列数和行数（用于粗切图）。\n"
+            "【核心原则：宁可少切，不要多切！切分的目的是分成几大块，不是切碎内容。】\n"
             "重要要求：\n"
-            "1) 只看大的分区边界，忽略表格内部细小格子线。\n"
-            f"2) 列数行数范围在 1~{LLM_MAX_COLS} / 1~{LLM_MAX_ROWS}。\n"
-            "3) 如果不确定，优先输出更少的行列数。\n\n"
+            "1) 只看【明显的、贯穿全图的】大分区边界，忽略所有表格内部线条和局部小格子。\n"
+            "2) 如果内容主要是连续的文字段落，通常只需要 1~2 列、1~2 行。\n"
+            "3) 只有当图中有【非常明显的、从上到下或从左到右完全贯穿的分割线】时，才增加列数或行数。\n"
+            f"4) 列数行数范围在 1~{LLM_MAX_COLS} / 1~{LLM_MAX_ROWS}，但建议优先选择 1 或 2。\n"
+            "5) 如果不确定，一律选择更少的行列数（例如 cols=1, rows=1）。\n\n"
             "输出格式必须严格为：\n"
             "type=XXX, cols=X, rows=Y"
         )
@@ -346,7 +354,7 @@ class DXFConverter:
         grid_trigger = (
             num_grid_nodes >= MASK_GRID_INTERSECTION_MIN
             and intersection_ratio >= MASK_GRID_INTERSECTION_RATIO
-            and line_ratio >= 0.25
+            and line_ratio >= 0.15  # 避免TEXT_ONLY被误判为STRUCTURED
         )
         if grid_trigger:
             print("    Mask网格交点触发结构化策略")
@@ -455,21 +463,27 @@ class DXFConverter:
                 snapped.append(cut)
         return sorted(set(snapped))
 
-    def _infer_mask_cuts(self, mask_path: str, target_cols: int, target_rows: int, layout_type: str = "STRUCTURED"):
+    def _infer_mask_cuts(self, mask_path: str, target_cols: int, target_rows: int, layout_type: str = "STRUCTURED",
+                         max_width_px: int = None):
         mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         if mask is None:
             return None
         mask01 = (mask > 0).astype(np.uint8) * 255
         h, w = mask01.shape
+        
+        # 如果指定了最大宽度，裁剪 mask（排除右侧图框栏）
+        if max_width_px is not None and max_width_px < w:
+            mask01 = mask01[:, :max_width_px]
+            w = max_width_px
 
         # 策略 A: TEXT_ONLY -> 找空白缝隙
         # 策略 B: STRUCTURED -> 找长直线
         if layout_type == "STRUCTURED":
-            # 提取长直线（水平/垂直分离），使用更强的核抑制文字
+            # 提取长直线（水平/垂直分离），使用较短的核以便检测表格分隔线
             h_lines, v_lines = self._extract_long_lines(
                 mask01,
-                kx_ratio=MASK_LINE_KERNEL_X_RATIO_STRUCT,
-                ky_ratio=MASK_LINE_KERNEL_Y_RATIO_STRUCT
+                kx_ratio=MASK_LINE_KERNEL_X_RATIO_CUT,
+                ky_ratio=MASK_LINE_KERNEL_Y_RATIO_CUT
             )
             find_func = self._find_line_bands
             q_x = MASK_PROJ_Q_LINE_X
@@ -507,8 +521,10 @@ class DXFConverter:
         if layout_type == "STRUCTURED" and not bands_x:
             # 结构图没有识别到明确竖线时，不强行补刀，避免切断文字
             cuts_x = []
-        if target_cols > 1 and len(cuts_x) < target_cols - 1 and not (layout_type == "STRUCTURED" and not bands_x):
-            cuts_x = self._merge_uniform_cuts(cuts_x, target_cols - 1, w)
+        # TEXT_ONLY 类型：只使用找到的空白缝隙，不强制补刀，避免切断文字
+        if layout_type != "TEXT_ONLY":
+            if target_cols > 1 and len(cuts_x) < target_cols - 1 and not (layout_type == "STRUCTURED" and not bands_x):
+                cuts_x = self._merge_uniform_cuts(cuts_x, target_cols - 1, w)
 
         x_pts = [0] + sorted(cuts_x) + [w]
         cuts_y_per_col = []
@@ -542,9 +558,9 @@ class DXFConverter:
                 elif len(cuts_y) < target_rows - 1:
                     cuts_y = self._merge_uniform_cuts(cuts_y, target_rows - 1, h)
             else:
-                # 纯文字模式，如果没找到空白带，还是要补刀（防止图太大）
-                if len(cuts_y) < target_rows - 1:
-                    cuts_y = self._merge_uniform_cuts(cuts_y, target_rows - 1, h)
+                # TEXT_ONLY 模式：只使用找到的空白缝隙，不强制补刀，避免切断文字
+                # 如果没找到明显的空白带，就保持不切
+                pass
             
             cuts_y_per_col.append(cuts_y)
 
@@ -553,7 +569,21 @@ class DXFConverter:
     def _build_boundaries_from_mask(self, mask_path: str, frame_x_min, frame_x_max,
                                     frame_y_min, frame_y_max, scale,
                                     target_cols: int, target_rows: int, layout_type: str = "STRUCTURED"):
-        inferred = self._infer_mask_cuts(mask_path, target_cols, target_rows, layout_type)
+        # 计算 mask 图像中需要处理的像素范围（排除右侧图框栏）
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            return None
+        full_mask_w = mask.shape[1]
+        
+        # 计算排除右侧后的像素宽度
+        if EXCLUDE_RIGHT_TITLEBAR_WIDTH > 0:
+            exclude_px = int(EXCLUDE_RIGHT_TITLEBAR_WIDTH * scale)
+            effective_w = max(100, full_mask_w - exclude_px)
+        else:
+            effective_w = full_mask_w
+        
+        inferred = self._infer_mask_cuts(mask_path, target_cols, target_rows, layout_type, 
+                                         max_width_px=effective_w)
         if not inferred:
             return None
         cuts_x_px, cuts_y_px_per_col, w, h = inferred
@@ -1373,8 +1403,10 @@ class DXFConverter:
         current_cluster = {'start': sorted_buckets[0], 'end': sorted_buckets[0], 
                           'count': x_counts[sorted_buckets[0]], 'buckets': [sorted_buckets[0]]}
         
+        # 聚类间隔：5000mm（5cm），小于此间隔的文字被认为属于同一列
+        CLUSTER_GAP_THRESHOLD = 5000
         for bucket in sorted_buckets[1:]:
-            if bucket - current_cluster['end'] <= 2000:
+            if bucket - current_cluster['end'] <= CLUSTER_GAP_THRESHOLD:
                 current_cluster['end'] = bucket
                 current_cluster['count'] += x_counts[bucket]
                 current_cluster['buckets'].append(bucket)
@@ -1395,10 +1427,19 @@ class DXFConverter:
         for i, c in enumerate(top_clusters):
             print(f"      列{i+1}: X={c['start']:.0f}~{c['end']:.0f}, 文字数={c['count']}")
         
-        # 构建列边界
+        # 构建列边界 - 使用两个相邻聚类之间的空白区域中心作为切分点
         col_boundaries = [frame_x_min]
         for i in range(1, len(top_clusters)):
-            cut_x = top_clusters[i]['start'] - CUT_OFFSET_X
+            prev_cluster_end = top_clusters[i-1]['end']
+            curr_cluster_start = top_clusters[i]['start']
+            # 检查两个聚类之间是否有足够的空白（至少 1000mm）
+            gap = curr_cluster_start - prev_cluster_end
+            if gap >= 1000:
+                # 在空白区域中心切分
+                cut_x = (prev_cluster_end + curr_cluster_start) / 2
+            else:
+                # 空白太小，使用下一个聚类起始位置左侧
+                cut_x = curr_cluster_start - CUT_OFFSET_X
             col_boundaries.append(cut_x)
         col_boundaries.append(frame_x_max)
         
@@ -1578,21 +1619,35 @@ class DXFConverter:
         
         return row_boundaries_per_col
     
-    def _is_region_empty(self, image, x1, y1, x2, y2):
-        """检查区域是否为空"""
+    def _is_region_empty(self, image, x1, y1, x2, y2, min_content_ratio=0.001):
+        """检查区域是否为空
+        
+        Args:
+            min_content_ratio: 最小内容占比阈值，低于此比例才认为是空的（默认 0.1%）
+        """
         if x2 <= x1 or y2 <= y1:
             return True
         
-        sample_step = max(1, min((x2 - x1) // 20, (y2 - y1) // 20))
+        # 使用更密集的采样来计算非背景色像素的比例
+        sample_step = max(1, min((x2 - x1) // 50, (y2 - y1) // 50))
         pixels = image.load()
+        
+        total_samples = 0
+        non_bg_samples = 0
         
         for x in range(x1, min(x2, image.width), sample_step):
             for y in range(y1, min(y2, image.height), sample_step):
+                total_samples += 1
                 pixel = pixels[x, y]
                 if pixel != BACKGROUND_COLOR:
-                    return False
+                    non_bg_samples += 1
         
-        return True
+        if total_samples == 0:
+            return True
+        
+        content_ratio = non_bg_samples / total_samples
+        # 只有当内容占比低于阈值时才认为是空的
+        return content_ratio < min_content_ratio
     
     def _split_and_save_image(self, image, frame_dir, frame_index, 
                                col_boundaries, row_boundaries_per_col, scale, bounds):
@@ -1609,6 +1664,8 @@ class DXFConverter:
         split_index = 1
         
         cols = len(col_boundaries) - 1
+        total_cells = sum(len(rb) - 1 for rb in row_boundaries_per_col)
+        is_single_cell = (cols == 1 and total_cells == 1)
         
         for col_idx in range(cols):
             col_left_dxf = col_boundaries[col_idx]
@@ -1636,9 +1693,10 @@ class DXFConverter:
                 if col_right_px <= col_left_px or row_bottom_px <= row_top_px:
                     continue
                 
-                # 检查区域是否为空
-                if self._is_region_empty(image, col_left_px, row_top_px, 
-                                         col_right_px, row_bottom_px):
+                # 检查区域是否为空（使用非常宽松的阈值，只删除完全空白的区域）
+                # 注：如果只有一个单元格，跳过空检查，始终保存
+                if not is_single_cell and self._is_region_empty(image, col_left_px, row_top_px, 
+                                         col_right_px, row_bottom_px, min_content_ratio=0.0001):
                     continue
                 
                 # 裁剪
@@ -1803,6 +1861,13 @@ class DXFConverter:
                     
                     height = getattr(entity.dxf, 'char_height', 2.5) * abs(scale_y)
                     text_rotation = getattr(entity.dxf, 'rotation', 0) + rotation
+                    # 获取 MTEXT 的行间距因子，默认为 1.0
+                    line_spacing_factor = getattr(entity.dxf, 'line_spacing_factor', 1.0)
+                    # 确保行间距因子合理（防止异常值）
+                    if line_spacing_factor < 0.5:
+                        line_spacing_factor = 1.0
+                    # 实际行间距 = 字符高度 * 行间距因子 * 基础间距系数
+                    line_spacing = height * line_spacing_factor * 1.6
                     
                     if text.strip():
                         text_data.append({
@@ -1811,7 +1876,7 @@ class DXFConverter:
                         })
                         for i, line in enumerate(text.split('\n')):
                             if line.strip():
-                                line_y = ty - i * height * 1.5
+                                line_y = ty - i * line_spacing
                                 self._draw_text_compressed(draw, image, line, tx, line_y,
                                                           height, text_rotation, color, bounds,
                                                           scale, drawn_boxes)
@@ -2065,6 +2130,9 @@ class DXFConverter:
         y_max = frame.y_max + margin
         bounds = (x_min, y_min, x_max, y_max)
         
+        # 排除右侧图框栏用于分割计算
+        x_max_for_split = x_max - EXCLUDE_RIGHT_TITLEBAR_WIDTH if EXCLUDE_RIGHT_TITLEBAR_WIDTH > 0 else x_max
+        
         dxf_w, dxf_h = x_max - x_min, y_max - y_min
         
         base_scale = TARGET_DPI / 25.4
@@ -2235,9 +2303,11 @@ class DXFConverter:
         image.save(full_png_path, 'PNG', dpi=(OUTPUT_DPI, OUTPUT_DPI))
         print(f"  完整PNG: {full_png_path}")
         
-        # 收集文字起始X坐标
-        x_starts_unique = self._collect_text_x_starts(x_min, x_max, y_min, y_max)
+        # 收集文字起始X坐标 - 使用排除图框栏后的边界
+        x_starts_unique = self._collect_text_x_starts(x_min, x_max_for_split, y_min, y_max)
         print(f"    文字起始X坐标数量: {len(x_starts_unique)}")
+        if EXCLUDE_RIGHT_TITLEBAR_WIDTH > 0:
+            print(f"    已排除右侧图框栏宽度: {EXCLUDE_RIGHT_TITLEBAR_WIDTH}mm")
         
         # 大模型判断行列数（可选）
         inferred_cols = None
@@ -2282,6 +2352,12 @@ class DXFConverter:
         if use_structured_fixed:
             effective_cols = STRUCTURED_FIXED_COLS
             effective_rows = STRUCTURED_FIXED_ROWS
+        else:
+            # TEXT_ONLY 类型，应用最大行列数限制（防止切分过细）
+            if effective_cols > TEXT_ONLY_MAX_COLS:
+                effective_cols = TEXT_ONLY_MAX_COLS
+            if effective_rows > TEXT_ONLY_MAX_ROWS:
+                effective_rows = TEXT_ONLY_MAX_ROWS
 
         # 临时覆盖全局切分参数（仅用于本图框切分）
         orig_cols, orig_rows = TARGET_COLS, TARGET_ROWS
@@ -2292,12 +2368,14 @@ class DXFConverter:
         if use_structured_fixed:
             print(f"    STRUCTURED 固定切分: {TARGET_COLS}列 x {TARGET_ROWS}行 (使用 fontstest-1 逻辑)")
 
-        # 优先使用 mask 投影定位切分线
+        # 优先使用 mask 投影定位切分线 - 使用排除图框栏后的边界
+        # 对于 STRUCTURED 类型，使用 mask 中的强竖线来确定切分位置
+        # 对于 TEXT_ONLY 类型，使用 mask 中的空白缝隙来确定切分位置
         mask_boundaries = None
         mask_cuts_px = None
-        if llm_mask_path and not use_structured_fixed:
+        if llm_mask_path:
             mask_boundaries = self._build_boundaries_from_mask(
-                llm_mask_path, x_min, x_max, y_min, y_max, scale,
+                llm_mask_path, x_min, x_max_for_split, y_min, y_max, scale,
                 target_cols=effective_cols, target_rows=effective_rows,
                 layout_type=inferred_type
             )
@@ -2305,13 +2383,13 @@ class DXFConverter:
                 mask_cuts_px = (mask_boundaries[2], mask_boundaries[3])
                 print(f"    Mask投影切分: {effective_cols}列 x {effective_rows}行 (策略: {inferred_type})")
 
-        # 计算切分边界
+        # 计算切分边界 - 使用排除图框栏后的边界
         print(f"    计算切分边界 ({TARGET_COLS}列 x {TARGET_ROWS}行)...")
         if mask_boundaries:
             col_boundaries, row_boundaries_per_col = mask_boundaries[:2]
         else:
             col_boundaries, row_boundaries_per_col = self._calculate_split_boundaries(
-                None, x_min, x_max, y_min, y_max, frame,
+                None, x_min, x_max_for_split, y_min, y_max, frame,
                 cluster_only=use_structured_fixed)
         
         # 打印列边界信息
@@ -2319,12 +2397,12 @@ class DXFConverter:
         print(f"    列边界: {[f'{b:.0f}' for b in col_boundaries]}")
         print(f"    列宽度: {[f'{w:.0f}' for w in col_widths]}")
         
-        # 绘制调试线条
+        # 绘制调试线条 - 使用排除图框栏后的边界
         if DEBUG_DRAW_LINES:
             print(f"    绘制调试线条...")
             debug_image = image.copy()
             debug_draw = ImageDraw.Draw(debug_image)
-            self._draw_debug_lines(debug_draw, debug_image, x_min, x_max, y_min, y_max,
+            self._draw_debug_lines(debug_draw, debug_image, x_min, x_max_for_split, y_min, y_max,
                                   scale, col_boundaries, x_starts_unique,
                                   mask_cuts_px=mask_cuts_px)
             # 保存带调试线条的图片（仅 debug 图）
